@@ -1,0 +1,259 @@
+import math
+import matplotlib.pyplot as plt
+import numpy as np
+import time
+import tracemalloc
+import ttnumpy as tt
+
+a = 1.0
+L = 1.0
+T = 2.0
+courant = 0.5
+
+def exact(x: float, t: float) -> float:
+    xi = ((x - a * t + L) % (2.0 * L)) - L
+
+    return (
+        1.0
+        if -0.5 <= xi <= 0.5
+        else 0.0
+    )
+
+
+def MPO(Nx: int, d: int, coeff: float) -> tt.TensorTrain:
+    M_dense = np.zeros((Nx, Nx), dtype=float)
+    for m in range(1, Nx):
+        M_dense[m, m] = 1.0 - coeff
+        M_dense[m, m - 1] = coeff
+
+    M_dense[0, 0] = 1.0 - coeff
+    M_dense[0, Nx - 1] = coeff
+    M_tensor = M_dense.reshape([2] * (2 * d))
+    pairs = [(2, 2)] * d
+
+    M_tt = tt.tt_svd(M_tensor, error=1e-12, physical_indexes=pairs, ttm=True)
+    return M_tt
+
+
+def MPS(d: int, rank_limit: int = 7):
+    Nx = 2**d
+    dx = 2.0 * L / Nx
+
+    dt_limit = courant * dx / a
+    Nt = math.ceil(T / dt_limit)
+    dt = T / Nt
+
+    coeff = a * dt / dx
+
+    tracemalloc.start()
+    t_start = time.perf_counter()
+
+    x = np.array([-L + i * dx for i in range(Nx)], dtype=float)
+    u_init_dense = np.array([exact(xi, 0.0) for xi in x], dtype=float)
+
+    u_tensor = u_init_dense.reshape([2] * d) # решейпнули нач усл вектор в тензор
+    u_tt = tt.tt_svd(u_tensor, error=1e-10)
+
+    M_tt = MPO(Nx, d, coeff)
+
+    print(f"d: {d}, узлов Nx: {Nx}")
+    print(f"TT-ранги оператора перехода M: {M_tt.bonds}")
+    print(f"Начальные TT-ранги состояния u: {u_tt.bonds}")
+    #сразу фиксируем бонд для его отслеживания
+    max_ranks = [max(u_tt.bonds)]
+    for _ in range(Nt):
+        u_tt = M_tt.dot(u_tt)
+        u_tt = u_tt.truncate(max_rank = rank_limit)
+
+        max_ranks.append(int(max(u_tt.bonds))) #бонд замер
+
+    print(f"Конечные TT-ранги состояния u: {u_tt.bonds}")
+
+    elapsed_time = time.perf_counter() - t_start
+    tracemalloc.stop()
+
+    # свертываем решение в вектор
+    u_final_tensor = u_tt.get_full_tensor()
+    u_num = u_final_tensor.reshape(-1)
+
+    # аналит реш при t = Nt * dt
+    u_ex = np.array([exact(xi, Nt * dt) for xi in x], dtype=float)
+    max_err = np.max(np.abs(u_num - u_ex))
+    stats = {
+        "time_sec": elapsed_time,
+        "bond_times": np.arange(Nt + 1) * dt,
+        "max_bonds": np.array(max_ranks, dtype=int)
+    }
+
+    return x, u_num, u_ex, max_err, stats
+
+
+def max_bond(stats, d):
+    times = stats["bond_times"]
+    max_bonds = stats["max_bonds"]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    ax.step(
+        times,
+        max_bonds,
+        where="post",
+        linewidth=2,
+        color="darkblue",
+        label=r"$r_{\max}(t)$"
+    )
+
+    ax.set_title(
+        f"Динамика максимального бонда: d = {d}, Nx = {2**d}"
+    )
+    ax.set_xlabel("Время t")
+    ax.set_ylabel("Максимальный бонд (после сжатия)")
+
+    ax.set_yticks(
+        np.arange(max_bonds.min(), max_bonds.max() + 1)
+    )
+
+    ax.grid(True, alpha=0.4)
+    ax.legend()
+    fig.tight_layout()
+
+    return fig, ax
+
+
+'''def compare_ranks():
+    d = 9
+    # здесь ошибки подобрала исходя из ранга которым хочу ограничить
+    rank_limits = [7, 6, 5, 4, 3, 2]
+    labels = ["r<=7", "r<=6", "r<=5", "r<=4", "r<=3", "r<=2"]
+    styles = ["-", "--", "-.", ":", "--", "-."]
+    markers = ["o", "s", "^", "D", "x", "v"]
+    plt.figure(figsize=(10, 6))
+    for rank, style, marker, label in zip(rank_limits, styles, markers, labels):
+        x, u_num, u_ex, err, stats = MPS(d=d, rank_limit = rank)
+        actual_max_r = int(stats["max_bonds"].max())
+        l2_err = np.sqrt(np.mean((u_num - u_ex) ** 2))
+        plt.plot(x, u_num, label=f"{label}, l2_err={l2_err:.3f}")
+
+
+    #plt.plot(x, u_ex, "k--", alpha=0.5, label="Аналитическое")
+    plt.plot(
+        x,
+        u_num,
+        linestyle=style,
+        marker=marker,
+        markevery=80,
+        markersize=5,
+        linewidth=1.5,
+        label=f"r ≤ {rank}, l2_err={l2_err:.6f}"
+    )
+
+    plt.title(f"Ухудшение решения при ограничении ранга (Nx = 2^{d})")
+    plt.xlabel("x")
+    plt.ylabel("u(x, t)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.show()'''
+
+
+def compare_ranks():
+    d = 13
+    reference_rank = 7
+    rank_limits = [6, 5, 4, 3, 2]
+
+    # опорное решение вычисл только один раз для r<=7
+    print(f"\nРасчёт опорного решения: r <= {reference_rank}", flush=True)
+
+    x_ref, u_ref, u_ex, err_ref, stats_ref = MPS(d=d,rank_limit=reference_rank)
+    rmse_ref = np.sqrt(np.mean((u_ref - u_ex) ** 2))
+    for rank in rank_limits:
+        print(f"\nРасчёт решения: r <= {rank}", flush=True)
+
+        x, u_num, u_ex_rank, err, stats = MPS(d=d, rank_limit=rank)
+
+        rmse = np.sqrt(np.mean((u_num - u_ex_rank) ** 2)) #l2_err
+        difference = np.max(np.abs(u_num - u_ref))
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        # АНАЛИТ РЕШЕНИЕ
+        ax.plot(
+            x_ref,
+            u_ex,
+            color="black",
+            linestyle="--",
+            linewidth=2,
+            alpha=0.7,
+            label="Аналитическое решение"
+        )
+
+        # ОПОРНОЕ РЕШ ПРИ ОГРАНИЧЕНИИ РАНГА 7
+        ax.plot(
+            x_ref,
+            u_ref,
+            color="blue",
+            linestyle="-",
+            linewidth=2,
+            label=(
+                f"r ≤ {reference_rank}, "
+                f"RMSE={rmse_ref:.6f}"
+            )
+        )
+
+        # РЕШ ПРИ ТЕКУЩЕМ ОГРАНИЧЕНИИ РАНГА
+        ax.plot(
+            x,
+            u_num,
+            color="red",
+            linestyle="-.",
+            linewidth=1.5,
+            marker="o",
+            markevery=80,
+            markersize=5,
+            markerfacecolor="none",
+            label=f"r ≤ {rank}, RMSE={rmse:.6f}"
+        )
+
+        ax.set_title(
+            f"Сравнение решений при r ≤ {reference_rank} "
+            f"и r ≤ {rank}\n"
+            f"Nx = {2**d}, T = {T}"
+        )
+
+        ax.set_xlabel("x")
+        ax.set_ylabel("u(x, t)")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        fig.tight_layout()
+
+        print(
+            f"r <= {rank}: "
+            f"RMSE = {rmse:.6e}, "
+            f"max|u_r - u_7| = {difference:.6e}",
+            flush=True
+        )
+    plt.show()
+
+def main():
+    d = 10
+    x, u_num, u_ex, err, stats = MPS(d=d, trunc_tol=1e-7)
+
+    print("=" * 45)
+    print(f"Максимальная ошибка: {err:.6e}")
+    print(f"Время расчета:                  {stats['time_sec']:.4f} сек")
+    print("=" * 45)
+
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(x, u_ex, "r--", linewidth=2, label="Аналитическое")
+    plt.plot(x, u_num, "b-", linewidth=2, label=f"MPS (Nx={2**d})")
+    plt.title(f"Сравнение решений при t = {T}")
+    plt.xlabel("x")
+    plt.ylabel("u(x, t)")
+    plt.grid(True)
+    plt.legend()
+
+
+    max_bond(stats, d)
+    plt.show()
+if __name__ == "__main__":
+    compare_ranks()
+    #main()
